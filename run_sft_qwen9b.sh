@@ -49,17 +49,29 @@ if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
 if ! "${PY}" -m pip --version >/dev/null 2>&1; then
     echo "  -> Python pip khong co. Dang cai dat (apt / ensurepip)..."
     if command -v apt-get >/dev/null 2>&1; then
-        APT="apt-get"
-        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then APT="sudo apt-get"; fi
-        "${APT}" update -qq
-        "${APT}" install -y -qq python3-pip python3-venv
+        APT_CMD=(apt-get)
+        if [ "$(id -u)" -ne 0 ]; then
+            if command -v sudo >/dev/null 2>&1; then
+                APT_CMD=(sudo apt-get)
+            else
+                echo "[WARN] Chua co sudo va dang khong phai root -> khong tu cai apt duoc."
+            fi
+        fi
+        if [ "${#APT_CMD[@]}" -gt 0 ]; then
+            "${APT_CMD[@]}" update -qq || echo "  -> [WARN] apt-get update that bai (mang/guong?), van thu ensurepip..."
+            "${APT_CMD[@]}" install -y -qq python3-pip python3-venv || true
+        fi
     fi
     "${PY}" -m ensurepip --upgrade >/dev/null 2>&1 || true
     if ! "${PY}" -m pip --version >/dev/null 2>&1; then
-        echo "[ERROR] Van chua cai duoc pip. Hay chay thu cong:"
-        echo "        sudo apt-get update && sudo apt-get install -y python3-pip python3-venv"
+        echo "[ERROR] Van chua cai duoc pip."
+        echo "        Dang nhap lam root va chay:"
+        echo "            apt-get update && apt-get install -y python3-pip python3-venv"
+        echo "        Hoac dung venv (khong can pip he thong):"
+        echo "            python3 -m venv ~/venv-sft && source ~/venv-sft/bin/activate"
         exit 1
     fi
+    echo "  -> pip OK: $("${PY}" -m pip --version | cut -d' ' -f1-2)"
 fi
 
 # Bao som: kiem tra GPU NVIDIA duoc nhin thay (WSL/Windows: can driver NVIDIA phia Windows,
