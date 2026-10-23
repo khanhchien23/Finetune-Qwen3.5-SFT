@@ -1,0 +1,40 @@
+# Du lieu nang (tu dong tai tu HuggingFace Hub khi chay run_sft_qwen9b.sh)
+data_hf/
+hf_sft_81classes_parquet/
+images/
+RealTest_Full_81Classes/
+RealTest_Full_81Classes.zip
+labels/
+
+# File CoT / parquet nang (da nam tren repo KhanhChien/military-81classes-sft-cot)
+sft_cot_81classes_*.jsonl
+thinking_logs_81classes.*
+dataset_dict.json
+
+# Checkpoint va output cua qua trinh train
+*-SFT-CoT-81Classes*/
+Qwen3.5-*-SFT*/
+Qwen4B-SFT*/
+*.safetensors
+*.pt
+*.bin
+*.ckpt
+
+# Python cache va file tam
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+scratch/
+charts_generated/
+slide_renders/
+debug_log_grpo.txt
+
+# Tai lieu thuyet minh / ket qua inference (khong can de chay pipeline)
+*.pptx
+*.pdf
+*_predictions_*.csv
+predictions_vs_gt_81classes.csv
+claude_predictions_81classes*.csv
+
+# File Windows (pipeline chinh chay tren Linux)
+*.bat
