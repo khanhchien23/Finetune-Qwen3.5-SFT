@@ -45,6 +45,36 @@ export PYTHONUNBUFFERED=1
 
 if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
 
+# Ubuntu/Debian ban minimal (dac biet la WSL) thuong chua co pip -> tu cai
+if ! "${PY}" -m pip --version >/dev/null 2>&1; then
+    echo "  -> Python pip khong co. Dang cai dat (apt / ensurepip)..."
+    if command -v apt-get >/dev/null 2>&1; then
+        APT="apt-get"
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then APT="sudo apt-get"; fi
+        "${APT}" update -qq
+        "${APT}" install -y -qq python3-pip python3-venv
+    fi
+    "${PY}" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    if ! "${PY}" -m pip --version >/dev/null 2>&1; then
+        echo "[ERROR] Van chua cai duoc pip. Hay chay thu cong:"
+        echo "        sudo apt-get update && sudo apt-get install -y python3-pip python3-venv"
+        exit 1
+    fi
+fi
+
+# Bao som: kiem tra GPU NVIDIA duoc nhin thay (WSL/Windows: can driver NVIDIA phia Windows,
+# KHONG cai driver qua apt trong WSL). Nuit som de khong mat thoi gian tai torch 2.5 GB roi moi loi.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    echo "  -> GPU visible:"
+    nvidia-smi -L | sed 's/^/       /'
+else
+    echo "[ERROR] Khong tim thay GPU NVIDIA (nvidia-smi khong chay duoc)."
+    echo "        WSL: cai driver GeForce moi nhat tren Windows, chay 'wsl --update' trong PowerShell,"
+    echo "             roi mo lai terminal. KHONG 'apt install' driver NVIDIA ben trong WSL."
+    echo "        May Linux thu: kiem tra 'lspci | grep -i nvidia' va dau vao driver."
+    exit 1
+fi
+
 # pip co the bi chan boi PEP 668 (Debian 12 / Ubuntu 24.04) -> thu --break-system-packages
 pip_install() {
     if ! "${PY}" -m pip install -q "$@" 2>/dev/null; then
