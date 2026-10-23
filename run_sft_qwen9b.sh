@@ -6,11 +6,12 @@
 #   Step 3: Train SFT with enable_thinking=True (ThinkingDataCollator)
 #
 #   Usage:
-#     bash run_sft_qwen9b.sh                                  # 1 GPU, tu do VRAM
-#     MODEL_ID=Qwen/Qwen3.5-4B bash run_sft_qwen9b.sh         # doi model
+#     bash run_sft_qwen9b.sh                                  # 9B 16-bit, can GPU >= 20GB
 #     NUM_GPUS=2 bash run_sft_qwen9b.sh                       # DDP qua torchrun
 #     TORCH_SOURCE=PYPI bash run_sft_qwen9b.sh                # torch tu PyPI mac dinh
 #     EPOCHS=2 LR=1e-4 bash run_sft_qwen9b.sh                 # override hyper-param
+#     HF_PUSH_REPO="" bash run_sft_qwen9b.sh                  # tat day checkpoint len HF
+#     HF_REPO_PUBLIC=1 bash run_sft_qwen9b.sh                 # repo HF cong khai
 # ==============================================================================
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -22,13 +23,19 @@ SCRIPT_DIR="$(pwd)"
 HF_DATASET_REPO="${HF_DATASET_REPO:-KhanhChien/military-81classes-sft-cot}"
 LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-${SCRIPT_DIR}/data_hf/military-81classes-sft-cot}"
 
-# GPU >= 22 GB (RTX 3090/4090/A100/L40S): chay 9B 16-bit duoc.
-# GPU 8-16 GB (RTX 4060/T4/L4/P100): nen MODEL_ID=Qwen/Qwen3.5-4B, script tu bat --use_4bit.
-MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-4B}"
+# Chay 9B 16-bit (LoRA, khong quantize) -> can GPU >= 20 GB (script kiem tra va dung som).
+MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-9B}"
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/$(basename "${MODEL_ID}")-SFT-CoT-81Classes-thinking}"
 
+# Repo HuggingFace de tu day moi checkpoint + final_adapter len.
+# Tat bang cach:  HF_PUSH_REPO="" bash run_sft_qwen9b.sh
+# Mo repo cong khai:  HF_REPO_PUBLIC=1 bash run_sft_qwen9b.sh
+# Can token:  export HF_TOKEN=hf_xxx   (hoac: huggingface-cli login)
+HF_PUSH_REPO="${HF_PUSH_REPO-KhanhChien/FineTuneQwen35-9B}"
+HF_REPO_PUBLIC="${HF_REPO_PUBLIC:-0}"
+
 EPOCHS="${EPOCHS:-1}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 LR="${LR:-2e-4}"
 LORA_R="${LORA_R:-16}"
@@ -114,7 +121,7 @@ if ! "${PY}" -c "import sys, torch; v=tuple(int(x) for x in torch.__version__.sp
         *)         echo "[ERROR] TORCH_SOURCE khong hop le: ${TORCH_SOURCE} (dung CUDA_12_6 | CUDA_12_4 | PYPI)"; exit 1 ;;
     esac
 fi
-pip_install -U "transformers>=4.57" accelerate peft bitsandbytes \
+pip_install -U "transformers>=4.57" accelerate peft \
     qwen-vl-utils datasets pyarrow huggingface_hub pillow tqdm
 "${PY}" -c "import torch, transformers, peft; print('  -> Env OK: torch=' + torch.__version__ + ' | cuda=' + str(torch.cuda.is_available()) + ' | transformers=' + transformers.__version__ + ' | peft=' + peft.__version__)"
 
@@ -158,9 +165,8 @@ print(f"  -> Dataset OK: Train = {len(ds['train'])} | Val = {val_n} | sample ima
 PYCHECK
 
 # ----------------------------------------------------------------------------
-# 3. Tu do VRAM -> bat QLoRA 4-bit neu < 22 GB
+# 3. Bao som: kiem tra VRAM du cho model 16-bit (Khong dung QLoRA 4-bit)
 # ----------------------------------------------------------------------------
-EXTRA_ARGS=()
 read -r VRAM_GB GPU_NAME <<EOF2
 $("${PY}" -c "import torch
 if torch.cuda.is_available():
@@ -170,20 +176,39 @@ else:
     print('0.0', 'no_cuda')")
 EOF2
 echo "  -> GPU: ${GPU_NAME} | VRAM: ${VRAM_GB} GB"
-if awk "BEGIN { exit !(${VRAM_GB} < 22) }"; then
-    echo "  -> VRAM < 22 GB: auto-enabling --use_4bit (QLoRA NF4)"
-    EXTRA_ARGS+=(--use_4bit)
+if awk "BEGIN { exit !(${VRAM_GB} < 20) }"; then
+    echo "[ERROR] Model ${MODEL_ID} chay 16-bit (LoRA, khong quantize) can GPU >= 20 GB"
+    echo "        (weights bf16 ~18 GB + activation/logits + optimizer)."
+    echo "        May co ${VRAM_GB} GB: dung Kaggle Note L4 (24 GB) / A100 (40 GB),"
+    echo "        Can GPU du VRAM de chay Qwen3.5-9B LoRA 16-bit, khong ho tro 4-bit."
+    exit 1
+fi
+echo "  -> VRAM >= 20 GB: huan thuan cho LoRA 16-bit (BF16), khong quantize."
+
+# ----------------------------------------------------------------------------
+# 4. Kiem tra HF token neu bat day checkpoint len Hub
+# ----------------------------------------------------------------------------
+TRAIN_ARGS_EXTRA=()
+if [ -n "${HF_PUSH_REPO}" ]; then
+    if [ -z "${HF_TOKEN:-}" ] && [ ! -f "${HOME}/.cache/huggingface/token" ] && [ ! -f "${HOME}/.hf_token" ]; then
+        echo "[WARN] Chua thay HF_TOKEN. Day checkpoint len '${HF_PUSH_REPO}' co the se that bai."
+        echo "       Hay chay:  export HF_TOKEN=hf_xxxxxxxx   (hoac: huggingface-cli login)"
+    fi
+    TRAIN_ARGS_EXTRA+=(--hub_repo "${HF_PUSH_REPO}")
+    if [ "${HF_REPO_PUBLIC}" = "1" ]; then
+        TRAIN_ARGS_EXTRA+=(--hub_public)
+    fi
+    echo "  -> Se tu day checkpoint + final_adapter len: ${HF_PUSH_REPO} (private=${HF_REPO_PUBLIC})"
 else
-    echo "  -> VRAM >= 22 GB: full 16-bit LoRA (BF16), no quantization"
+    echo "  -> HF_PUSH_REPO trong -> khong day len Hub."
 fi
 
-# Bao som neu model + 4-bit van vuot qua VRAM (tranh mat hang gio tai xong crash)
-"${PY}" - "${MODEL_ID}" "${VRAM_GB}" "${EXTRA_ARGS[@]:-}" <<'PYPREFLIGHT'
+# Bao som neu model vuot qua VRAM (tranh mat hang gio tai xong crash)
+"${PY}" - "${MODEL_ID}" "${VRAM_GB}" <<'PYPREFLIGHT'
 import sys
 from huggingface_hub import HfApi
 
 model_id, vram_gb = sys.argv[1], float(sys.argv[2])
-use_4bit = "--use_4bit" in sys.argv[3:]
 try:
     info = HfApi().model_info(model_id, files_metadata=True)
     gb = sum(f.size or 0 for f in info.siblings
@@ -191,17 +216,18 @@ try:
 except Exception as exc:
     print(f"  -> [preflight] Bo qua kiem tra kich thuoc ({type(exc).__name__})")
     sys.exit(0)
-need = (gb * 0.5 + 2.5) if use_4bit else (gb + 3.0)
-print(f"  -> [preflight] {model_id}: {gb:.1f} GB weights | uoc tinh can ~{need:.1f} GB tren {vram_gb:.1f} GB VRAM")
+# LoRA 16-bit: toan bo weights (bf16) + ~3 GB activation/logits/optimizer (gradient checkpointing, bs nho)
+need = gb + 3.0
+print(f"  -> [preflight] {model_id}: {gb:.1f} GB weights (bf16) | uoc tinh can ~{need:.1f} GB tren {vram_gb:.1f} GB VRAM")
 if need > vram_gb:
     print(f"[ERROR] GPU KHONG du cho model nay ({need:.1f} GB > {vram_gb:.1f} GB).")
-    print("        Chay local: MODEL_ID=Qwen/Qwen3.5-4B bash run_sft_qwen9b.sh")
-    print("        Hoac dung thong qua Kaggle Note GPU T4/P100 (16 GB) / L4 (24 GB).")
+    print("        Chay tren may GPU >= 24 GB (L4/A100/4090) hoac Kaggle Note.")
+    print("        Can GPU du VRAM de chay model 16-bit, khong ho tro 4-bit.")
     sys.exit(1)
 PYPREFLIGHT
 
 echo
-echo "[3/3] Starting SFT Training (enable_thinking=True) on ${MODEL_ID}..."
+echo "[3/3] Starting SFT Training (enable_thinking=True, LoRA 16-bit) on ${MODEL_ID}..."
 TRAIN_ARGS=(
     --model_id "${MODEL_ID}"
     --parquet_dir "${LOCAL_DATA_DIR}"
@@ -215,8 +241,8 @@ TRAIN_ARGS=(
     --save_steps "${SAVE_STEPS}"
     --max_seq_length "${MAX_SEQ_LEN}"
 )
-if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
-    TRAIN_ARGS+=("${EXTRA_ARGS[@]}")
+if [ "${#TRAIN_ARGS_EXTRA[@]}" -gt 0 ]; then
+    TRAIN_ARGS+=("${TRAIN_ARGS_EXTRA[@]}")
 fi
 
 if [ "${NUM_GPUS}" -gt 1 ]; then
@@ -229,4 +255,7 @@ echo
 echo "=============================================================================="
 echo "  COMPLETED. Final LoRA adapter saved at:"
 echo "  ${OUTPUT_DIR}/final_adapter"
+if [ -n "${HF_PUSH_REPO}" ]; then
+    echo "  Da day len HuggingFace:  https://huggingface.co/${HF_PUSH_REPO}/tree/main/final_adapter"
+fi
 echo "=============================================================================="

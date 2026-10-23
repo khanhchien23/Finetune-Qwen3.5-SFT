@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 r"""
 Script huấn luyện SFT (Supervised Fine-Tuning) với Chain-of-Thought (CoT)
-cho mô hình Qwen3.5-4B / Qwen3-VL-4B-Instruct / Qwen2.5-VL-3B-Instruct
+cho mô hình Qwen3.5-9B (LoRA BF16/FP16, không lượng tử hóa 4-bit)
 trên bộ dữ liệu 81 lớp phương tiện quân sự (`sft_cot_81classes_all.jsonl`).
 
 Đặc điểm tối ưu hóa cho Kaggle (2x T4 16GB hoặc P100 16GB) & Local GPU:
@@ -40,6 +40,7 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     AutoModelForImageTextToText,
+    TrainerCallback,
     TrainingArguments,
     Trainer,
 )
@@ -59,8 +60,8 @@ except ImportError:
 # ==============================================================================
 # 1. CẤU HÌNH MẶC ĐỊNH
 # ==============================================================================
-DEFAULT_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen3.5-4B")
-DEFAULT_OUTPUT_DIR = "/kaggle/working/Qwen4B-SFT-CoT-81Classes" if os.path.exists("/kaggle/working") else "./Qwen4B-SFT-CoT-81Classes"
+DEFAULT_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen3.5-9B")
+DEFAULT_OUTPUT_DIR = "/kaggle/working/Qwen3.5-9B-SFT-CoT-81Classes" if os.path.exists("/kaggle/working") else "./Qwen3.5-9B-SFT-CoT-81Classes"
 
 # Kích thước ảnh thực tế trong bộ mô phỏng (640x640 -> sau khi crop BBox diện tích từ 64,800 đến 139,500 px):
 # Đặt MIN_PIXELS = 64 * 28 * 28 (~50,176 px) và MAX_PIXELS = 256 * 28 * 28 (~200,704 px)
@@ -377,7 +378,7 @@ class ThinkingDataCollator:
 
 
 # ==============================================================================
-# 4. HÀM KHỞI TẠO MÔ HÌNH QWEN-4B + LORA (PEFT) + CHUNKED CROSS-ENTROPY LOSS
+# 4. HÀM KHỞI TẠO MÔ HÌNH QWEN-9B + LORA (PEFT) + CHUNKED CROSS-ENTROPY LOSS
 # ==============================================================================
 class MemoryEfficientTrainer(Trainer):
     """
@@ -411,7 +412,68 @@ class MemoryEfficientTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
-def build_model_and_processor(model_id: str, lora_r: int = 16, lora_alpha: int = 32, use_qlora_4bit: bool = False):
+class HubPushCallback(TrainerCallback):
+    """Sau moi lan luu checkpoint / final adapter -> day len HuggingFace Hub.
+
+    - Chi chay o rank 0 (DDP).
+    - file_pattern chi mang adapter LoRA + processor (`*.safetensors`, `*.json`,
+      `adapter_config*`, `*tokenizer*`, `chat_template*`, `preprocessor*`,
+      `video_preprocessor*`), KHONG day `optimizer.pt`/`scheduler.pt`/`trainer_state.json`
+      (nang va vo nghia voi nguoi tai ve de inference).
+    - Loi day (thieu token, mat mang) chi in canh bao, KHONG lam gay train.
+    """
+
+    def __init__(self, repo_id: str, private: bool = True):
+        from huggingface_hub import create_repo, HfApi
+        self.repo_id = repo_id
+        self.api = HfApi()
+        self.url = create_repo(repo_id=repo_id, private=private, exist_ok=True)
+        print(f"--> Hub push da bat: {repo_id}")
+
+    def _folder_files(self, folder: str) -> List[str]:
+        keep = []
+        for name in sorted(os.listdir(folder)):
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path):
+                continue
+            lower = name.lower()
+            if (lower.endswith((".safetensors", ".json"))
+                    or "tokenizer" in lower or "chat_template" in lower
+                    or "preprocessor" in lower):
+                keep.append(path)
+        return keep
+
+    def _push(self, folder: str, path_in_repo: str, commit_note: str):
+        try:
+            files = self._folder_files(folder)
+            if not files:
+                print(f"--> [hub] Bo qua {path_in_repo} (khong co file adapter nao)")
+                return
+            self.api.upload_folder(
+                repo_id=self.repo_id, folder_path=folder,
+                path_in_repo=path_in_repo, commit_message=commit_note,
+            )
+            print(f"--> [hub] Da day {len(files)} file -> {self.repo_id}/{path_in_repo}")
+        except Exception as exc:
+            print(f"--> [hub] CANH BAO: day {path_in_repo} that bai: {type(exc).__name__}: {exc}")
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        folder = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if os.path.isdir(folder):
+            self._push(folder, f"checkpoint-{state.global_step}",
+                       f"Upload checkpoint-{state.global_step}")
+
+    def on_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        final_dir = os.path.join(args.output_dir, "final_adapter")
+        if os.path.isdir(final_dir):
+            self._push(final_dir, "final_adapter", "Upload final_adapter (complete)")
+
+
+def build_model_and_processor(model_id: str, lora_r: int = 16, lora_alpha: int = 32):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     gpu_name = torch.cuda.get_device_name(local_rank) if torch.cuda.is_available() else ""
     # bf16 yêu cầu card Ampere/Ada/Hopper trở lên (A100/A6000/L40/L40S/H100/4090/5090...);
@@ -430,7 +492,7 @@ def build_model_and_processor(model_id: str, lora_r: int = 16, lora_alpha: int =
 
     if local_rank == 0:
         print(f"--> Đang tải Processor & Model: {model_id}")
-        print(f"--> GPU: {gpu_name} | Dtype: {compute_dtype} | QLoRA 4-bit: {use_qlora_4bit}")
+        print(f"--> GPU: {gpu_name} | Dtype: {compute_dtype} | LoRA 16-bit (khong 4-bit)")
 
     # Chuẩn mới của transformers v5+: truyền size={'shortest_edge': MIN_PIXELS, 'longest_edge': MAX_PIXELS}
     try:
@@ -454,16 +516,7 @@ def build_model_and_processor(model_id: str, lora_r: int = 16, lora_alpha: int =
         "device_map": {"": local_rank} if torch.cuda.is_available() else None,
     }
 
-    if use_qlora_4bit:
-        from transformers import BitsAndBytesConfig
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=compute_dtype,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-    else:
-        model_kwargs["dtype"] = compute_dtype
+    model_kwargs["dtype"] = compute_dtype
 
     try:
         model = AutoModelForImageTextToText.from_pretrained(model_id, **model_kwargs)
@@ -500,7 +553,7 @@ def build_model_and_processor(model_id: str, lora_r: int = 16, lora_alpha: int =
 # 5. CHƯƠNG TRÌNH HUẤN LUYỆN CHÍNH
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="SFT CoT Training for Qwen-4B/9B on 81 Military Classes")
+    parser = argparse.ArgumentParser(description="SFT CoT Training for Qwen3.5-9B (LoRA 16-bit) on 81 Military Classes")
     parser.add_argument("--model_id", type=str, default=DEFAULT_MODEL_ID)
     parser.add_argument("--parquet_dir", type=str, default=None, help="Đường dẫn thư mục chứa file .parquet hoặc repo HuggingFace")
     parser.add_argument("--jsonl_path", type=str, default=None)
@@ -517,7 +570,11 @@ def main():
     parser.add_argument("--max_seq_length", type=int, default=1280)
     parser.add_argument("--crop_bbox", action="store_true", default=True)
     parser.add_argument("--no_crop_bbox", action="store_false", dest="crop_bbox")
-    parser.add_argument("--use_4bit", action="store_true", default=False)
+    parser.add_argument("--hub_repo", type=str, default=None,
+                        help="Repo HuggingFace de tu day checkpoint/final_adapter, vd: KhanhChien/FineTuneQwen35-9B")
+    parser.add_argument("--hub_private", action="store_true", default=True,
+                        help="Tao repo Hoang (mac dinh). Dung --hub_public de repo Cong khai")
+    parser.add_argument("--hub_public", action="store_false", dest="hub_private")
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -552,7 +609,6 @@ def main():
         args.model_id,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        use_qlora_4bit=args.use_4bit,
     )
     collator = ThinkingDataCollator(processor=processor, max_seq_length=args.max_seq_length)
     # Kiểm tra template/masking ngay trước khi khởi chạy vòng lặp train.
@@ -583,8 +639,17 @@ def main():
         remove_unused_columns=False,
         ddp_find_unused_parameters=False,
         report_to="none",
-        optim="paged_adamw_8bit" if args.use_4bit else "adamw_torch",
+        optim="adamw_torch",
     )
+
+    callbacks = []
+    if args.hub_repo and local_rank == 0:
+        try:
+            callbacks.append(HubPushCallback(args.hub_repo, private=args.hub_private))
+        except Exception as exc:
+            print(f"--> [hub] CANH BAO: khong khoi tao duoc repo '{args.hub_repo}' "
+                  f"({type(exc).__name__}: {exc}). Se chay train ma khong day Hub. "
+                  "Kiem tra HF_TOKEN: export HF_TOKEN=hf_xxx  (hoac: huggingface-cli login)")
 
     trainer = MemoryEfficientTrainer(
         model=model,
@@ -592,6 +657,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=collator,
+        callbacks=callbacks or None,
     )
 
     # 4. Tự động Resume từ checkpoint gần nhất nếu có
